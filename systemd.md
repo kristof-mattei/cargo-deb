@@ -203,6 +203,22 @@ systemd-units = [
 
 An entry without a `unit-name` applies to all unit files in the package. Unit files installed via `assets` are covered by whichever entry their file name matches.
 
+A `unit-name` may also include a unit type extension (e.g. `my-api.socket`), in which case the entry applies to exactly that unit file rather than to every unit file sharing the stem. This is the equivalent of `dh_installsystemd`'s positional `unit file ...` arguments and makes it possible to configure a socket separately from its socket-activated service:
+
+```toml
+[package.metadata.deb]
+maintainer-scripts = "debian/"
+systemd-units = [
+        { unit-name = "my-daemon" },
+        # never start the service directly, it is socket-activated
+        { unit-name = "my-api.service", start = false },
+        # enable and arm the socket at install time
+        { unit-name = "my-api.socket" },
+    ]
+```
+
+Note that an exact entry like `my-api.socket` only looks for the source files `<package>.my-api.socket` and `my-api.socket` in the maintainer scripts (or `unit-scripts`) directory; the less specific fallbacks that apply to stem entries (such as `<package>.socket`) are not used.
+
 #### Advanced Example
 
 For a more advanced example you might want to look at the [NLnet Labs Krill project](https://github.com/NLnetLabs/krill/) use of cargo-deb (disclaimer: this author is a contributor) which shows:
