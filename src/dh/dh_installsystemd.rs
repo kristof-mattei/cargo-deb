@@ -20,7 +20,7 @@ use std::str;
 use crate::assets::Asset;
 use crate::dh::dh_lib::{autoscript, pkgfile, ScriptFragments};
 use crate::listener::Listener;
-use crate::util::{fname_from_path, MyJoin};
+use crate::util::{fname_from_path, is_path_file, MyJoin};
 use crate::{CDResult, CargoDebError};
 
 /// From `man 1 dh_installsystemd` on Ubuntu 20.04 LTS. See:
@@ -136,6 +136,25 @@ pub struct Options {
 pub fn find_units(dir: &Path, main_package: &str, unit_name: Option<&str>) -> PackageUnitFiles {
     let mut installables = HashMap::new();
 
+    // A unit name with a unit type extension (e.g. "foo.socket") identifies a
+    // single unit file, unlike a plain unit name which covers every unit type
+    // sharing its stem. Look only for that file, without the less specific
+    // fallbacks (e.g. "<package>.socket") that pkgfile() would try, as those
+    // are unit files in their own right and not defaults for the named unit.
+    if let Some((stem, unit_type)) = unit_name.and_then(split_exact_unit_name) {
+        let paths_to_try = [
+            dir.join(format!("{main_package}.{stem}.{unit_type}")),
+            dir.join(format!("{stem}.{unit_type}")),
+        ];
+        if let Some(src_path) = paths_to_try.into_iter().find(|p| is_path_file(p)) {
+            installables.insert(src_path, InstallRecipe {
+                path: Path::new(LIB_SYSTEMD_SYSTEM_DIR).join(format!("{stem}.{unit_type}")),
+                mode: 0o644,
+            });
+        }
+        return installables;
+    }
+
     for (package_suffix, unit_type, install_dir) in &SYSTEMD_UNIT_FILE_INSTALL_MAPPINGS {
         let package_name = &format!("{main_package}{package_suffix}");
         if let Some(src_path) = pkgfile(dir, main_package, package_name, unit_type, unit_name) {
@@ -186,6 +205,30 @@ fn is_unit_of(fname: &str, unit_name: &str) -> bool {
     fname.rsplit_once('.').is_some_and(|(stem, _)| stem == unit_name)
 }
 
+/// Determine if the given unit file name is covered by the given unit name:
+/// either the unit name refers to the file exactly (e.g. "foo.socket"), or the
+/// file is one of the unit files sharing the unit name as its stem (e.g. "foo").
+///
+/// Exact matches let entries configure unit files of the same unit separately,
+/// e.g. start a socket while not starting its socket-activated service. This
+/// mirrors `dh_installsystemd`'s positional `unit file ...` arguments.
+fn is_unit_file_covered_by(fname: &str, unit_name: &str) -> bool {
+    fname == unit_name || is_unit_of(fname, unit_name)
+}
+
+/// Split a unit name that refers to a single unit file (e.g. "foo.socket") into
+/// its stem and unit type extension. Returns `None` for plain unit names (e.g.
+/// "foo"), which cover all unit files sharing their stem. Only unit types
+/// installed to [`LIB_SYSTEMD_SYSTEM_DIR`] are recognized: ".tmpfile" is not a
+/// real unit type (those files are installed as ".conf" files elsewhere).
+fn split_exact_unit_name(unit_name: &str) -> Option<(&str, &str)> {
+    let (stem, unit_type) = unit_name.rsplit_once('.')?;
+    SYSTEMD_UNIT_FILE_INSTALL_MAPPINGS
+        .iter()
+        .any(|&(suffix, ut, dir)| suffix.is_empty() && ut == unit_type && dir == LIB_SYSTEMD_SYSTEM_DIR)
+        .then_some((stem, unit_type))
+}
+
 /// Strip off any first layer of outer quotes according to systemd quoting
 /// rules.
 ///
@@ -213,8 +256,9 @@ fn unquote(s: &str) -> &str {
 /// manually in Cargo.toml, that will be installed into `LIB_SYSTEMD_SYSTEM_DIR`
 /// will be analysed.
 ///
-/// When `unit_name` is provided, we only act on unit files whose file name (stripped of the unit type extension) matches.
-/// This allows per `systemd-units` entry settings.
+/// When `unit_name` is provided, we only act on unit files whose file name (stripped of the unit type extension)
+/// matches, or whose full file name matches exactly (e.g. "foo.socket"). This allows per `systemd-units` entry
+/// settings, down to the individual unit files of a single unit.
 ///
 /// Unlike `dh_installsystemd` results are accumulated into the given `ScriptFragments` value
 /// rather than being written to temporary files on disk.
@@ -237,7 +281,7 @@ pub fn generate(package: &str, assets: &[Asset], unit_name: Option<&str>, option
         .filter(|a| a.c.target_path.starts_with(USR_LIB_TMPFILES_D_DIR))
         .filter(|a| match unit_name {
             Some(unit_name) => fname_from_path(a.c.target_path.as_path())
-                .is_some_and(|fname| fname == unit_name || is_unit_of(&fname, unit_name)),
+                .is_some_and(|fname| is_unit_file_covered_by(&fname, unit_name)),
             None => true,
         })
         .map(|v| {
@@ -268,7 +312,7 @@ pub fn generate(package: &str, assets: &[Asset], unit_name: Option<&str>, option
             .filter_map(|a| fname_from_path(a.c.target_path.as_path()))
             .filter(|fname| !fname.contains('@'))
             .filter(|fname| match unit_name {
-                Some(unit_name) => is_unit_of(fname, unit_name),
+                Some(unit_name) => is_unit_file_covered_by(fname, unit_name),
                 None => true,
             }),
     );
@@ -748,6 +792,31 @@ Type=simple".to_owned();
     }
 
     #[test]
+    fn find_units_for_exact_unit_file_name() {
+        let _g = add_test_fs_paths(&[
+            "debian/myunit.socket",
+            "debian/myunit.service", // same stem, different type: not covered
+            "debian/mypkg.socket",   // pkgfile()-style fallback: must not be used
+        ]);
+
+        let pkg_unit_files = find_units(Path::new("debian"), "mypkg", Some("myunit.socket"));
+        assert_eq_found_unit(&pkg_unit_files, "usr/lib/systemd/system/myunit.socket", "debian/myunit.socket");
+        assert_eq!(1, pkg_unit_files.len());
+    }
+
+    #[test]
+    fn find_units_for_exact_unit_file_name_prefers_package_prefixed_source() {
+        let _g = add_test_fs_paths(&[
+            "debian/mypkg.myunit.socket",
+            "debian/myunit.socket",
+        ]);
+
+        let pkg_unit_files = find_units(Path::new("debian"), "mypkg", Some("myunit.socket"));
+        assert_eq_found_unit(&pkg_unit_files, "usr/lib/systemd/system/myunit.socket", "debian/mypkg.myunit.socket");
+        assert_eq!(1, pkg_unit_files.len());
+    }
+
+    #[test]
     fn generate_scopes_actions_to_the_given_unit_name() {
         let mut mock_listener = crate::listener::MockListener::new();
         mock_listener.expect_progress().return_const(());
@@ -765,6 +834,40 @@ Type=simple".to_owned();
         let postinst = fragments.get("mypkg.postinst.service").unwrap();
         assert!(postinst.contains("other.service"));
         assert!(!postinst.contains("main.service"));
+    }
+
+    #[test]
+    fn generate_scopes_actions_to_an_exact_unit_file_name() {
+        let mut mock_listener = crate::listener::MockListener::new();
+        mock_listener.expect_progress().return_const(());
+
+        let _g = add_test_fs_paths(&[]);
+
+        // a socket-activated service: both unit files share the stem "main"
+        let assets = vec![
+            unit_asset("debian/main.service", "usr/lib/systemd/system/main.service"),
+            unit_asset("debian/main.socket", "usr/lib/systemd/system/main.socket"),
+        ];
+
+        let mut fragments = ScriptFragments::new();
+
+        let entries = [
+            // the service must never be started directly
+            (Some("main.service"), Options { restart_after_upgrade: true, no_start: true, ..Options::default() }),
+            // the socket is armed on install
+            (Some("main.socket"), Options { restart_after_upgrade: true, ..Options::default() }),
+        ];
+
+        for (unit_name, options) in &entries {
+            generate("mypkg", &assets, *unit_name, options, &mut fragments, &mock_listener).unwrap();
+        }
+
+        let postinst = fragments.get("mypkg.postinst.service").unwrap();
+        assert!(postinst.contains("deb-systemd-invoke $_dh_action main.socket"));
+        assert!(postinst.contains("deb-systemd-invoke try-restart main.service"));
+
+        assert!(!postinst.contains("$_dh_action main.service"));
+        assert!(!postinst.contains("try-restart main.socket"));
     }
 
     #[test]
